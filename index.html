@@ -218,6 +218,75 @@ details.pg summary{display:flex;align-items:center;gap:10px;cursor:pointer;font-
 <div id="busy" role="status"><div class="ring"></div><p id="busyt">Working…</p></div>
 <div id="toast" role="alert"></div>
 <script>
+/* PDF standard security handler, RC4 128-bit (V2/R3). No external libraries. */
+function md5(m){
+  const K=new Uint32Array(64),S=[7,12,17,22,5,9,14,20,4,11,16,23,6,10,15,21];
+  for(let i=0;i<64;i++)K[i]=Math.floor(Math.abs(Math.sin(i+1))*4294967296)>>>0;
+  const n=m.length,len=((n+8>>6)+1)<<6,b=new Uint8Array(len);b.set(m);b[n]=0x80;
+  const dv=new DataView(b.buffer);dv.setUint32(len-8,(n*8)>>>0,true);dv.setUint32(len-4,Math.floor(n/536870912),true);
+  let a0=0x67452301,b0=0xefcdab89,c0=0x98badcfe,d0=0x10325476;
+  for(let o=0;o<len;o+=64){
+    const M=[];for(let i=0;i<16;i++)M[i]=dv.getUint32(o+i*4,true);
+    let A=a0,B=b0,C=c0,D=d0;
+    for(let i=0;i<64;i++){
+      let F,g;
+      if(i<16){F=(B&C)|(~B&D);g=i}else if(i<32){F=(D&B)|(~D&C);g=(5*i+1)%16}else if(i<48){F=B^C^D;g=(3*i+5)%16}else{F=C^(B|~D);g=(7*i)%16}
+      F=(F+A+K[i]+M[g])>>>0;A=D;D=C;C=B;
+      const s=S[(i>>4)*4+(i&3)];B=(B+((F<<s)|(F>>>(32-s))))>>>0;
+    }
+    a0=(a0+A)>>>0;b0=(b0+B)>>>0;c0=(c0+C)>>>0;d0=(d0+D)>>>0;
+  }
+  const out=new Uint8Array(16),ov=new DataView(out.buffer);ov.setUint32(0,a0,true);ov.setUint32(4,b0,true);ov.setUint32(8,c0,true);ov.setUint32(12,d0,true);return out;
+}
+function rc4(key,data){
+  const s=new Uint8Array(256);for(let i=0;i<256;i++)s[i]=i;
+  for(let i=0,j=0;i<256;i++){j=(j+s[i]+key[i%key.length])&255;[s[i],s[j]]=[s[j],s[i]]}
+  const o=new Uint8Array(data.length);
+  for(let k=0,i=0,j=0;k<data.length;k++){i=(i+1)&255;j=(j+s[i])&255;[s[i],s[j]]=[s[j],s[i]];o[k]=data[k]^s[(s[i]+s[j])&255]}
+  return o;
+}
+const cat=(...a)=>{const n=a.reduce((x,y)=>x+y.length,0),o=new Uint8Array(n);let p=0;for(const x of a){o.set(x,p);p+=x.length}return o};
+const PAD=Uint8Array.from([0x28,0xBF,0x4E,0x5E,0x4E,0x75,0x8A,0x41,0x64,0x00,0x4E,0x56,0xFF,0xFA,0x01,0x08,0x2E,0x2E,0x00,0xB6,0xD0,0x68,0x3E,0x80,0x2F,0x0C,0xA9,0xFE,0x64,0x53,0x69,0x7A]);
+const padPw=pw=>{const u=new TextEncoder().encode(pw).slice(0,32);return cat(u,PAD).slice(0,32)};
+function encryptPdf(L,bytes,userPw,ownerPw,perm){
+  const {PDFDocument,PDFName,PDFNumber,PDFHexString,PDFString,PDFDict,PDFArray,PDFRawStream,PDFStream}=L;
+  return (async()=>{
+    const doc=await PDFDocument.load(bytes);
+    const ctx=doc.context;
+    const id=crypto.getRandomValues(new Uint8Array(16));
+    let P=0xFFFFF0C0|(perm.print?4|2048:0)|(perm.copy?16:0);P=P|0;
+    let h=md5(padPw(ownerPw));for(let i=0;i<50;i++)h=md5(h);
+    const okey=h.slice(0,16);let O=rc4(okey,padPw(userPw));
+    for(let i=1;i<=19;i++)O=rc4(okey.map(x=>x^i),O);
+    const pb=new Uint8Array(4);new DataView(pb.buffer).setInt32(0,P,true);
+    let k=md5(cat(padPw(userPw),O,pb,id));for(let i=0;i<50;i++)k=md5(k.slice(0,16));
+    const key=k.slice(0,16);
+    let U=rc4(key,md5(cat(PAD,id)));for(let i=1;i<=19;i++)U=rc4(key.map(x=>x^i),U);
+    U=cat(U,new Uint8Array(16));
+    const objKey=(num,gen)=>md5(cat(key,Uint8Array.from([num&255,(num>>8)&255,(num>>16)&255,gen&255,(gen>>8)&255]))).slice(0,16);
+    const hex=u=>PDFHexString.of(Array.from(u,x=>x.toString(16).padStart(2,'0')).join(''));
+    const toBytes=s=>s instanceof PDFHexString?s.asBytes():s.asBytes();
+    function walk(v,ok){
+      if(v instanceof PDFDict){for(const [kk,vv] of v.entries()){
+        if(vv instanceof PDFString||vv instanceof PDFHexString)v.set(kk,hex(rc4(ok,vv.asBytes())));else walk(vv,ok)}}
+      else if(v instanceof PDFArray){for(let i=0;i<v.size();i++){const vv=v.get(i);
+        if(vv instanceof PDFString||vv instanceof PDFHexString)v.set(i,hex(rc4(ok,vv.asBytes())));else walk(vv,ok)}}
+    }
+    for(const [ref,obj] of ctx.enumerateIndirectObjects()){
+      const ok=objKey(ref.objectNumber,ref.generationNumber);
+      if(obj instanceof PDFStream){
+        const dict=obj.dict;walk(dict,ok);
+        const raw=obj instanceof PDFRawStream?obj.contents:obj.getContents();
+        ctx.assign(ref,PDFRawStream.of(dict,rc4(ok,raw)));
+      }else if(obj instanceof PDFDict||obj instanceof PDFArray){walk(obj,ok)}
+      else if(obj instanceof PDFString||obj instanceof PDFHexString){ctx.assign(ref,hex(rc4(ok,obj.asBytes())))}
+    }
+    const enc=ctx.obj({Filter:'Standard',V:2,R:3,Length:128,P:P,O:hex(O),U:hex(U)});
+    ctx.trailerInfo.Encrypt=ctx.register(enc);
+    ctx.trailerInfo.ID=ctx.obj([hex(id),hex(id)]);
+    return await doc.save({useObjectStreams:false});
+  })();
+}
 'use strict';
 /* ========= core helpers ========= */
 const { PDFDocument, StandardFonts, rgb, degrees } = PDFLib;
@@ -1038,11 +1107,7 @@ tool('protect', 'Security', 'Password Protect', 'Lock a PDF with a password', 'l
   const p1 = inp('password', '', { autocomplete: 'new-password' }); const p2 = inp('password', '', { autocomplete: 'new-password' }); const pr = chk('Allow printing', true); const cp = chk('Allow copying text', false); const res = resultBox();
   area.append(panel('Choose a password', fld('Password', p1), fld('Repeat password', p2), pr.el, cp.el, h('p', { class: 'note' }, h('b', null, 'Remember it. '), 'There is no way to recover a lost password.')), btn('Lock PDF', () => withBusy('Encrypting…', async () => {
     if (p1.value.length < 4) throw new Error('Use at least 4 characters.'); if (p1.value !== p2.value) throw new Error('The two passwords do not match.');
-    if (!window.PDFLibEnc) { const keep = window.PDFLib; await loadScript('https://cdn.jsdelivr.net/npm/pdf-lib-plus-encrypt@1.1.1/dist/pdf-lib.min.js'); window.PDFLibEnc = window.PDFLib; window.PDFLib = keep; }
-    const d = await window.PDFLibEnc.PDFDocument.load(ctx.bytes);
-    if (typeof d.encrypt !== 'function') throw new Error('Encryption is not available in this build.');
-    d.encrypt({ userPassword: p1.value, ownerPassword: p1.value + '#owner', permissions: { printing: pr.input.checked ? 'highResolution' : false, modifying: false, copying: cp.input.checked, annotating: false, fillingForms: false, contentAccessibility: true, documentAssembly: false } });
-    const bytes = await d.save();
+    const bytes = await encryptPdf(PDFLib, ctx.bytes, p1.value, p1.value + '#owner', { print: pr.input.checked, copy: cp.input.checked });
     await showResult(res, { bytes, name: baseName(ctx.name) + '-locked.pdf', note: 'Password protected', tool: 'protect' });
   }), 'primary'), res);
 }));
